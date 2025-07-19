@@ -19,12 +19,6 @@ const (
 	QueryBill         = "QueryBill"
 )
 
-type BillSummary struct {
-	Status BillStatus `json:"status"`
-	Total  int64      `json:"total"`
-	Items  []LineItem `json:"items"`
-}
-
 func BillWorkflow(ctx workflow.Context, billID, acctID string, cur currency.Currency, periodEnd time.Time) error {
 	logger := log.With(
 		workflow.GetLogger(ctx),
@@ -48,9 +42,9 @@ func BillWorkflow(ctx workflow.Context, billID, acctID string, cur currency.Curr
 
 	bill := &Bill{Status: BillOpen}
 
-	err := workflow.SetQueryHandler(ctx, QueryBill, func() (BillSummary, error) {
+	err := workflow.SetQueryHandler(ctx, QueryBill, func() (Bill, error) {
 		snapshot := append([]LineItem(nil), bill.Items...)
-		return BillSummary{
+		return Bill{
 			Status: bill.Status,
 			Total:  bill.Total,
 			Items:  snapshot,
@@ -92,7 +86,10 @@ func BillWorkflow(ctx workflow.Context, billID, acctID string, cur currency.Curr
 			}).
 			AddReceive(cancelCh, func(c workflow.ReceiveChannel, _ bool) {
 				c.Receive(ctx, nil)
-				bill.Cancel()
+				if err := bill.Cancel(); err != nil {
+					logger.Warn("cancel ignored", "err", err)
+					return
+				}
 				cancelTimer()
 				logger.Info("cancel signal received")
 			}).
@@ -108,41 +105,88 @@ func BillWorkflow(ctx workflow.Context, billID, acctID string, cur currency.Curr
 	case BillCanceled, BillExpired:
 		return nil
 	case BillCharging:
-		wg := workflow.NewWaitGroup(ctx)
-		wg.Add(len(bill.Items))
+		// 1) charge all pending items
+		chargeWG := workflow.NewWaitGroup(ctx)
 		for i := range bill.Items {
-			idx := i
+			item := &bill.Items[i]
+			if item.Status != ItemPending {
+				continue
+			}
+			chargeWG.Add(1)
 			workflow.Go(ctx, func(c workflow.Context) {
-				defer wg.Done()
-				it := bill.Items[idx]
-				err := workflow.ExecuteActivity(c, ChargeLineItemActivity, it).Get(c, nil)
+				defer chargeWG.Done()
+				err := workflow.ExecuteActivity(c, ChargeLineItemActivity, *item).Get(c, nil)
 
 				if err != nil {
-					bill.Items[idx].Status = ItemFailed
-					logger.Warn("item charge failed", "item_id", it.ID, "attempts_exhausted", true, "err", err)
+					item.Status = ItemFailed
+					logger.Warn("item charge failed", "item_id", item.ID, "attempts_exhausted", true, "err", err)
 				} else {
-					bill.Items[idx].Status = ItemCharged
-					logger.Info("item charged", "item_id", it.ID, "amount", it.Amount)
+					item.Status = ItemCharged
+					logger.Info("item charged", "item_id", item.ID, "amount", item.Amount)
 				}
 			})
 		}
-		wg.Wait(ctx)
+		chargeWG.Wait(ctx)
 
-		failedCount := bill.ValidateCharges()
+		// 2) count failures
+		failedCount := 0
+		for _, it := range bill.Items {
+			if it.Status == ItemFailed {
+				failedCount++
+			}
+		}
+		totalItems := len(bill.Items)
 
-		if failedCount > 0 {
-			failedIDs := make([]string, 0)
+		// 3) branch on result
+		switch {
+		case failedCount == totalItems:
+			// all failed -> bill fails
+			if failedCount == totalItems {
+				failedIDs := make([]string, 0, failedCount)
+				for _, it := range bill.Items {
+					failedIDs = append(failedIDs, it.ID)
+				}
+				bill.Status = BillFailed
+				logger.Error("all items failed; bill failed", "failed_items", failedCount)
+
+				return temporal.NewApplicationError(fmt.Sprintf("%d items failed: %v", failedCount, failedIDs), "ChargeFailed", failedIDs)
+			}
+		case failedCount == 0:
+			// none failed -> success
+			bill.Status = BillSettled
+			logger.Info("bill settled")
+		default:
+			// partial failure -> refund the charged items
+			refundWG := workflow.NewWaitGroup(ctx)
+			refundedCount := 0
+			for i := range bill.Items {
+				item := &bill.Items[i]
+				if item.Status == ItemCharged {
+					refundWG.Add(1)
+					workflow.Go(ctx, func(c workflow.Context) {
+						defer refundWG.Done()
+						// the refund does not fail for demo purposes
+						_ = workflow.ExecuteActivity(c, RefundLineItemActivity, *item).Get(c, nil)
+						item.Status = ItemRefunded
+						refundedCount++
+						logger.Info("item refunded", "item_id", item.ID)
+					})
+				}
+			}
+			refundWG.Wait(ctx)
+
+			bill.Status = BillCompensated
+			logger.Error("bill partially failed and refunded items", "refunded_items", refundedCount, "failed_items", failedCount)
+			failedIDs := make([]string, 0, failedCount)
 			for _, it := range bill.Items {
 				if it.Status == ItemFailed {
 					failedIDs = append(failedIDs, it.ID)
 				}
 			}
 
-			logger.Error("bill failed", "failed_items", failedCount)
-			return temporal.NewApplicationError(fmt.Sprintf("%d items failed: %v", failedCount, failedIDs), "ChargeFailed", failedIDs)
-		} else {
-			logger.Info("bill settled")
+			return temporal.NewApplicationError(fmt.Sprintf("refunded %d items after %d failures", refundedCount, failedCount), "ChargeCompensated", failedIDs)
 		}
+
 	default:
 		logger.Error("unexpected status after selector", "status", bill.Status)
 		return temporal.NewNonRetryableApplicationError("invalid state", "", nil)
@@ -152,9 +196,16 @@ func BillWorkflow(ctx workflow.Context, billID, acctID string, cur currency.Curr
 }
 
 func ChargeLineItemActivity(_ context.Context, li LineItem) error {
+	// simulates a charge with a mocked fail case
 	time.Sleep(100 * time.Millisecond)
 	if li.Name == "FAIL" {
 		return fmt.Errorf("simulated failure for %s", li.ID)
 	}
+	return nil
+}
+
+func RefundLineItemActivity(_ context.Context, li LineItem) error {
+	// simulates a refund
+	time.Sleep(100 * time.Millisecond)
 	return nil
 }

@@ -13,15 +13,17 @@ const (
 	ItemCharged  LineItemStatus = "CHARGED"
 	ItemFailed   LineItemStatus = "FAILED"
 	ItemCanceled LineItemStatus = "CANCELED"
+	ItemRefunded LineItemStatus = "REFUNDED"
 )
 
 const (
-	BillOpen     BillStatus = "OPEN"
-	BillCharging BillStatus = "CHARGING"
-	BillSettled  BillStatus = "SETTLED"
-	BillCanceled BillStatus = "CANCELED"
-	BillExpired  BillStatus = "EXPIRED"
-	BillFailed   BillStatus = "FAILED"
+	BillOpen        BillStatus = "OPEN"
+	BillCharging    BillStatus = "CHARGING"
+	BillSettled     BillStatus = "SETTLED"
+	BillCanceled    BillStatus = "CANCELED"
+	BillExpired     BillStatus = "EXPIRED"
+	BillFailed      BillStatus = "FAILED"
+	BillCompensated BillStatus = "COMPENSATED"
 )
 
 type LineItem struct {
@@ -38,8 +40,10 @@ type Bill struct {
 }
 
 var (
-	ErrBillNotOpen   = errors.New("bill is not open")
-	ErrDuplicateItem = func(id string) error { return fmt.Errorf("item %s already exists", id) }
+	ErrBillNotOpen    = errors.New("bill is not open")
+	ErrCannotCancel   = errors.New("cannot cancel bill in current state")
+	ErrNoPendingItems = errors.New("no pending items to charge")
+	ErrDuplicateItem  = func(id string) error { return fmt.Errorf("item %s already exists", id) }
 )
 
 func (b *Bill) AddItem(li LineItem) error {
@@ -61,32 +65,24 @@ func (b *Bill) BeginCharge() error {
 	if b.Status != BillOpen {
 		return ErrBillNotOpen
 	}
+	if b.PendingCount() == 0 {
+		return ErrNoPendingItems
+	}
 	b.Status = BillCharging
 	return nil
 }
 
-func (b *Bill) ValidateCharges() int {
-	failCount := 0
-	for _, it := range b.Items {
-		if it.Status == ItemFailed {
-			failCount++
-		}
+func (b *Bill) Cancel() error {
+	if b.Status != BillOpen {
+		return ErrCannotCancel
 	}
-	if failCount > 0 {
-		b.Status = BillFailed
-	} else {
-		b.Status = BillSettled
-	}
-	return failCount
-}
-
-func (b *Bill) Cancel() {
 	b.Status = BillCanceled
 	for i := range b.Items {
 		if b.Items[i].Status == ItemPending {
 			b.Items[i].Status = ItemCanceled
 		}
 	}
+	return nil
 }
 
 func (b *Bill) Expire() {
@@ -96,4 +92,14 @@ func (b *Bill) Expire() {
 			b.Items[i].Status = ItemCanceled
 		}
 	}
+}
+
+func (b *Bill) PendingCount() int {
+	cnt := 0
+	for _, it := range b.Items {
+		if it.Status == ItemPending {
+			cnt++
+		}
+	}
+	return cnt
 }

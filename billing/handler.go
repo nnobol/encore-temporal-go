@@ -14,7 +14,43 @@ import (
 	"encore.dev/beta/errs"
 
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/worker"
 )
+
+var taskQueue = "billing"
+
+// service setup and lifecycle (initService/Shutdown) follow Encore service struct guidelines:
+// https://encore.dev/docs/go/primitives/service-structs
+
+//encore:service
+type Service struct {
+	temporalClient client.Client
+	temporalWorker worker.Worker
+}
+
+func initService() (*Service, error) {
+	c, err := client.Dial(client.Options{})
+	if err != nil {
+		return nil, fmt.Errorf("error creating temporal client: %w", err)
+	}
+
+	w := worker.New(c, taskQueue, worker.Options{})
+
+	w.RegisterWorkflow(BillWorkflow)
+	w.RegisterActivity(ChargeLineItemActivity)
+	w.RegisterActivity(RefundLineItemActivity)
+
+	if err := w.Start(); err != nil {
+		c.Close()
+		return nil, fmt.Errorf("error starting termporal worker: %w", err)
+	}
+	return &Service{temporalClient: c, temporalWorker: w}, nil
+}
+
+func (s *Service) Shutdown(ctx context.Context) {
+	s.temporalWorker.Stop()
+	s.temporalClient.Close()
+}
 
 type CreateBillRequest struct {
 	AccountID string `json:"account_id"`
@@ -112,7 +148,7 @@ func (s *Service) AddItem(ctx context.Context, id string, req AddItemRequest) er
 		return &errs.Error{Code: errs.NotFound, Message: "bill not found"}
 	}
 
-	var snap BillSummary
+	var snap Bill
 	if err := qr.Get(&snap); err != nil {
 		return err
 	}
@@ -134,5 +170,49 @@ func (s *Service) AddItem(ctx context.Context, id string, req AddItemRequest) er
 		Status: ItemPending,
 	}
 
-	return s.temporalClient.SignalWorkflow(ctx, id, "", SignalAddLineItem, li)
+	if err := s.temporalClient.SignalWorkflow(ctx, id, "", SignalAddLineItem, li); err != nil {
+		return &errs.Error{Code: errs.Internal, Message: "failed to signal billing workflow: " + err.Error()}
+	}
+
+	return nil
+}
+
+//encore:api public method=POST path=/bills/:id/charge
+func (s *Service) ChargeBill(ctx context.Context, id string) (*Bill, error) {
+	qr, err := s.temporalClient.QueryWorkflow(ctx, id, "", QueryBill)
+	if err != nil {
+		return nil, &errs.Error{Code: errs.NotFound, Message: "bill not found"}
+	}
+	var summary Bill
+	if err := qr.Get(&summary); err != nil {
+		return nil, &errs.Error{Code: errs.Internal, Message: err.Error()}
+	}
+
+	if summary.Status != BillOpen {
+		return nil, &errs.Error{
+			Code:    errs.FailedPrecondition,
+			Message: fmt.Sprintf("cannot charge bill in status %s", summary.Status),
+		}
+	}
+
+	if summary.PendingCount() == 0 {
+		return nil, &errs.Error{
+			Code:    errs.FailedPrecondition,
+			Message: "cannot charge bill with no pending items",
+		}
+	}
+
+	if err := s.temporalClient.SignalWorkflow(ctx, id, "", SignalChargeBill, nil); err != nil {
+		return nil, &errs.Error{Code: errs.Internal, Message: "failed to signal billing workflow: " + err.Error()}
+	}
+
+	qr2, err := s.temporalClient.QueryWorkflow(ctx, id, "", QueryBill)
+	if err != nil {
+		return nil, &errs.Error{Code: errs.Internal, Message: err.Error()}
+	}
+	if err := qr2.Get(&summary); err != nil {
+		return nil, &errs.Error{Code: errs.Internal, Message: err.Error()}
+	}
+
+	return &summary, nil
 }
