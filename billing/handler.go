@@ -1,3 +1,6 @@
+// Package billing implements the core billing service, exposing a set of Encore API endpoints
+// that allow for bill creation, item management, and bill state changes. It integrates with
+// Temporal to manage long-running billing processes asynchronously and reliably.
 package billing
 
 import (
@@ -9,7 +12,6 @@ import (
 	"time"
 
 	"pave-fees-api/internal/currency"
-	"pave-fees-api/internal/data"
 
 	"encore.dev/beta/errs"
 
@@ -19,15 +21,18 @@ import (
 
 var taskQueue = "billing"
 
-// service setup and lifecycle (initService/Shutdown) follow Encore service struct guidelines:
-// https://encore.dev/docs/go/primitives/service-structs
-
+// Service encapsulates the Temporal client and worker used by the billing service
+// to orchestrate billing workflows and activities.
+//
 //encore:service
 type Service struct {
 	temporalClient client.Client
 	temporalWorker worker.Worker
 }
 
+// initService initializes the Temporal client and worker for the billing service.
+// It registers the workflow and activities and starts the worker.
+// This function is called automatically by Encore when the service starts.
 func initService() (*Service, error) {
 	c, err := client.Dial(client.Options{})
 	if err != nil {
@@ -39,6 +44,7 @@ func initService() (*Service, error) {
 	w.RegisterWorkflow(BillWorkflow)
 	w.RegisterActivity(ChargeLineItemActivity)
 	w.RegisterActivity(RefundLineItemActivity)
+	w.RegisterActivity(CreditAccountActivity)
 
 	if err := w.Start(); err != nil {
 		c.Close()
@@ -47,13 +53,14 @@ func initService() (*Service, error) {
 	return &Service{temporalClient: c, temporalWorker: w}, nil
 }
 
+// Shutdown gracefully stops the Temporal worker and closes the client connection.
+// This is called automatically when the Encore service is shut down.
 func (s *Service) Shutdown(ctx context.Context) {
 	s.temporalWorker.Stop()
 	s.temporalClient.Close()
 }
 
 type CreateBillRequest struct {
-	AccountID string `json:"account_id"`
 	Currency  string `json:"currency"`
 	PeriodEnd string `json:"period_end,omitempty"`
 }
@@ -71,19 +78,6 @@ func (s *Service) CreateBill(ctx context.Context, req CreateBillRequest) (*Creat
 	reqCur, err := currency.Parse(req.Currency)
 	if err != nil {
 		return nil, &errs.Error{Code: errs.InvalidArgument, Message: err.Error()}
-	}
-
-	if strings.TrimSpace(req.AccountID) == "" {
-		return nil, &errs.Error{Code: errs.InvalidArgument, Message: "'account_id' is required and must be non-empty"}
-	}
-
-	accCur, err := data.LookupAccount(req.AccountID)
-	if err != nil {
-		return nil, &errs.Error{Code: errs.NotFound, Message: err.Error()}
-	}
-
-	if reqCur != accCur {
-		return nil, &errs.Error{Code: errs.InvalidArgument, Message: fmt.Sprintf("currency mismatch: account %s is %s but request was %s", req.AccountID, accCur, reqCur)}
 	}
 
 	var periodEnd time.Time
@@ -111,7 +105,6 @@ func (s *Service) CreateBill(ctx context.Context, req CreateBillRequest) (*Creat
 		},
 		BillWorkflow,
 		billID,
-		req.AccountID,
 		reqCur,
 		periodEnd,
 	)
@@ -203,7 +196,7 @@ func (s *Service) ChargeBill(ctx context.Context, id string) (*Bill, error) {
 	}
 
 	if err := s.temporalClient.SignalWorkflow(ctx, id, "", SignalChargeBill, nil); err != nil {
-		return nil, &errs.Error{Code: errs.Internal, Message: "failed to signal billing workflow: " + err.Error()}
+		return nil, &errs.Error{Code: errs.Internal, Message: "failed to signal workflow for charge: " + err.Error()}
 	}
 
 	qr2, err := s.temporalClient.QueryWorkflow(ctx, id, "", QueryBill)
@@ -215,4 +208,51 @@ func (s *Service) ChargeBill(ctx context.Context, id string) (*Bill, error) {
 	}
 
 	return &summary, nil
+}
+
+//encore:api public method=POST path=/bills/:id/cancel
+func (s *Service) CancelBill(ctx context.Context, id string) (*Bill, error) {
+	qr, err := s.temporalClient.QueryWorkflow(ctx, id, "", QueryBill)
+	if err != nil {
+		return nil, &errs.Error{Code: errs.NotFound, Message: "bill not found"}
+	}
+	var bill Bill
+	if err := qr.Get(&bill); err != nil {
+		return nil, &errs.Error{Code: errs.Internal, Message: err.Error()}
+	}
+
+	if bill.Status != BillOpen {
+		return nil, &errs.Error{
+			Code:    errs.FailedPrecondition,
+			Message: fmt.Sprintf("cannot cancel bill in status %s", bill.Status),
+		}
+	}
+
+	if err := s.temporalClient.SignalWorkflow(ctx, id, "", SignalCancelBill, nil); err != nil {
+		return nil, &errs.Error{Code: errs.Internal, Message: "failed to signal workflow for cancel: " + err.Error()}
+	}
+
+	qr2, err := s.temporalClient.QueryWorkflow(ctx, id, "", QueryBill)
+	if err != nil {
+		return nil, &errs.Error{Code: errs.Internal, Message: err.Error()}
+	}
+	if err := qr2.Get(&bill); err != nil {
+		return nil, &errs.Error{Code: errs.Internal, Message: err.Error()}
+	}
+
+	return &bill, nil
+}
+
+//encore:api public method=GET path=/bills/:id
+func (s *Service) GetBill(ctx context.Context, id string) (*Bill, error) {
+
+	qr, err := s.temporalClient.QueryWorkflow(ctx, id, "", QueryBill)
+	if err != nil {
+		return nil, &errs.Error{Code: errs.NotFound, Message: "bill not found"}
+	}
+	var bill Bill
+	if err := qr.Get(&bill); err != nil {
+		return nil, &errs.Error{Code: errs.Internal, Message: err.Error()}
+	}
+	return &bill, nil
 }

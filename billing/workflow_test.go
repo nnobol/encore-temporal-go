@@ -20,6 +20,7 @@ func (s *UnitTestSuite) SetupTest(t *testing.T) {
 	s.env = s.NewTestWorkflowEnvironment()
 	s.env.RegisterActivity(ChargeLineItemActivity)
 	s.env.RegisterActivity(RefundLineItemActivity)
+	s.env.RegisterActivity(CreditAccountActivity)
 }
 
 func TestUnitTestSuite(t *testing.T) {
@@ -32,6 +33,8 @@ func TestUnitTestSuite(t *testing.T) {
 		{"BillWorkflow_ChargeFail", (*UnitTestSuite).Test_BillWorkflow_ChargeFail},
 		{"BillWorkflow_Canceled", (*UnitTestSuite).Test_BillWorkflow_Canceled},
 		{"BillWorkflow_Expired", (*UnitTestSuite).Test_BillWorkflow_Expired},
+		{"Test_BillWorkflow_ChargeWithNoItems_Expires", (*UnitTestSuite).Test_BillWorkflow_ChargeWithNoItems_Expires},
+		{"Test_BillWorkflow_AllItemsFail", (*UnitTestSuite).Test_BillWorkflow_AllItemsFail},
 	}
 
 	for _, tc := range tests {
@@ -54,7 +57,6 @@ func (s *UnitTestSuite) Test_BillWorkflow_Settled(t *testing.T) {
 	s.env.ExecuteWorkflow(
 		BillWorkflow,
 		"bill-happy",
-		"acc-usd",
 		currency.USD,
 		time.Now().Add(24*time.Hour),
 	)
@@ -102,7 +104,7 @@ func (s *UnitTestSuite) Test_BillWorkflow_DuplicateItem(t *testing.T) {
 		s.env.SignalWorkflow(SignalChargeBill, nil)
 	}, 0)
 
-	s.env.ExecuteWorkflow(BillWorkflow, "dup-bill", "acc", currency.USD, time.Now().Add(24*time.Hour))
+	s.env.ExecuteWorkflow(BillWorkflow, "dup-bill", currency.USD, time.Now().Add(24*time.Hour))
 	if err := s.env.GetWorkflowError(); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -129,7 +131,7 @@ func (s *UnitTestSuite) Test_BillWorkflow_ChargeFail(t *testing.T) {
 		s.env.SignalWorkflow(SignalChargeBill, nil)
 	}, 0)
 
-	s.env.ExecuteWorkflow(BillWorkflow, "fail-bill", "acc", currency.USD, time.Now().Add(24*time.Hour))
+	s.env.ExecuteWorkflow(BillWorkflow, "fail-bill", currency.USD, time.Now().Add(24*time.Hour))
 	err := s.env.GetWorkflowError()
 	if err == nil {
 		t.Fatal("expected error on partial failure compensation")
@@ -172,7 +174,6 @@ func (s *UnitTestSuite) Test_BillWorkflow_Canceled(t *testing.T) {
 	s.env.ExecuteWorkflow(
 		BillWorkflow,
 		"bill-cancel",
-		"acc-usd",
 		currency.USD,
 		time.Now().Add(24*time.Hour),
 	)
@@ -213,7 +214,6 @@ func (s *UnitTestSuite) Test_BillWorkflow_Expired(t *testing.T) {
 	s.env.ExecuteWorkflow(
 		BillWorkflow,
 		"bill-expire",
-		"acc-usd",
 		currency.USD,
 		time.Now().Add(24*time.Hour),
 	)
@@ -254,7 +254,6 @@ func (s *UnitTestSuite) Test_BillWorkflow_ChargeWithNoItems_Expires(t *testing.T
 	s.env.ExecuteWorkflow(
 		BillWorkflow,
 		"no-items-bill",
-		"acc-usd",
 		currency.USD,
 		time.Now().Add(24*time.Hour),
 	)
@@ -285,7 +284,6 @@ func (s *UnitTestSuite) Test_BillWorkflow_AllItemsFail(t *testing.T) {
 	s.env.ExecuteWorkflow(
 		BillWorkflow,
 		"fail-all-bill",
-		"acc-usd",
 		currency.USD,
 		time.Now().Add(24*time.Hour),
 	)
