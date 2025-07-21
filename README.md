@@ -38,6 +38,35 @@ encore run
 ```
 This automatically starts all services and registers Temporal workflows and workers inside initService() — no main.go needed.
 
+## Testing the Project
+
+The project includes a range of tests covering:
+
+- **Pure functions** — Business logic methods like `AddItem`, `BeginCharge`, `Cancel`, etc.
+- **HTTP handlers and Temporal workflows** — These are tested via the Encore `initService()` function, simulating service calls to ensure end-to-end behavior.
+
+### Prerequisites
+
+Before running the entire suite of tests, ensure that **temporalite** is running:
+
+```bash
+temporalite start --namespace default --ephemeral
+```
+
+This step is required because handler tests involve communication with Temporal workflows. Without Temporalite running, these tests will fail with connection errors.
+
+### Running All Tests
+
+From the project root, run:
+
+```bash
+go test ./...
+```
+This will run:
+
+- All unit tests (pure functions)
+- All integration tests (handlers + Temporal)
+
 ## API and Services Overview
 
 ### Billing Service Endpoints
