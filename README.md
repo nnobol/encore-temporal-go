@@ -1,6 +1,7 @@
 # Encore + Temporal Billing API
 
-This project implements a **Fees/Billing API** using [Encore](https://encore.dev) and [Temporal](https://temporal.io). It demonstrates service orchestration using Temporal workflows, service-to-service communication within Encore, and handling stateful business processes such as billing and fee collection.
+This project implements a **Billing/Fees API** using [Encore](https://encore.dev) and [Temporal](https://temporal.io). It demonstrates service orchestration using Temporal workflows, service-to-service communication within Encore, and handling stateful business processes such as adding line items to a bill, charging a bill, canceling an open bill, etc.
+
 
 ## Running the Project
 
@@ -14,12 +15,12 @@ To run this project locally, you'll need the following installed:
 
 ```bash
 git clone https://github.com/nnobol/encore-temporal-go.git
-cd encore-temporal-go
 ```
 
 ### 2. Install dependencies
 
 ```bash
+cd encore-temporal-go
 go mod tidy
 ```
 
@@ -35,7 +36,7 @@ Use --ephemeral flag to automatically wipe history between runs.
 ```bash
 encore run
 ```
-This automatically starts your services and registers Temporal workflows and workers inside initService() — no main.go needed.
+This automatically starts all services and registers Temporal workflows and workers inside initService() — no main.go needed.
 
 ## API and Services Overview
 
@@ -59,12 +60,12 @@ This automatically starts your services and registers Temporal workflows and wor
 
 ## Project Structure and Design Thoughts
 
-### Why the `account` service?\
+### Why the `account` service?
 
 The assignment focused on building a billing system, but I decided to introduce a lightweight `account` service to simulate service-to-service communication in Encore. This served multiple purposes:
 
 - It made the `billing` workflow meaningful by **crediting the account** upon successful bill settlement.
-- It allowed me to explore **Temporal activities**, where `billing` asynchronously calls `account` to update balances.
+- It allowed me to explore service-to-service communication within Encore, where `billing` asynchronously calls `account` to update balances.
 - It added a natural feedback loop to billing: once we charge, we can see its effect via `GET /balances`.
 
 > In real systems, `account` would likely persist data in a ledger database. Here, it uses in-memory maps for simplicity.
@@ -73,6 +74,6 @@ The assignment focused on building a billing system, but I decided to introduce 
 
 To keep the assignment focused on Temporal and Encore integration, I chose **not** to integrate a real DB or currency system. Instead:
 
-- The list of supported currencies (USD, EUR, GEL) is hardcoded and parsed in a safe, typed way.
-- Balances in `account` are stored in a `map` protected by a mutex - thread-safe but ephemeral.
+- The list of supported currencies (USD, EUR, GEL) is hardcoded and parsed in a safe way.
+- Balances in `account` are stored in a `map` protected by a mutex - thread-safe but ephemeral (data gets lost if services reload/restart).
 - In real life, currencies and accounts would likely be tied together and stored in a database.
